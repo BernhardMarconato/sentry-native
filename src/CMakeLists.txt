@@ -103,7 +103,7 @@ elseif(LINUX OR ANDROID)
 	sentry_target_sources_cwd(sentry
 		modulefinder/sentry_modulefinder_linux.c
 	)
-elseif(AIX)
+	elseif(AIX)
 	sentry_target_sources_cwd(sentry
 		modulefinder/sentry_modulefinder_aix.c
 	)
@@ -117,6 +117,7 @@ if(SENTRY_TRANSPORT_CURL)
 elseif(SENTRY_TRANSPORT_WINHTTP)
 	sentry_target_sources_cwd(sentry
 		transports/sentry_transport_winhttp.c
+		transports/winhttp_common.c
 	)
 elseif(SENTRY_TRANSPORT_NONE)
 	sentry_target_sources_cwd(sentry
@@ -143,6 +144,12 @@ elseif(SENTRY_BACKEND_INPROC)
 elseif(SENTRY_BACKEND_NONE)
 	sentry_target_sources_cwd(sentry
 		backends/sentry_backend_none.c
+	)
+elseif(SENTRY_BACKEND_WER)
+	target_compile_definitions(sentry PRIVATE SENTRY_BACKEND_WER)
+	sentry_target_sources_cwd(sentry
+		backends/sentry_backend_wer.cpp
+		transports/winhttp_common.c
 	)
 endif()
 
