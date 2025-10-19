@@ -126,7 +126,7 @@ write_minidump(const PWER_RUNTIME_EXCEPTION_INFORMATION info, wchar_t *path_out,
     }
     MINIDUMP_EXCEPTION_INFORMATION mei = {};
     mei.ThreadId = GetThreadId(info->hThread);
-    mei.ClientPointers = FALSE;
+    mei.ClientPointers = TRUE;
     EXCEPTION_POINTERS exc_ptrs = { &info->exceptionRecord, &info->context };
     mei.ExceptionPointers = &exc_ptrs;
     BOOL ok = MiniDumpWriteDump(info->hProcess, GetProcessId(info->hProcess), h,

@@ -138,8 +138,8 @@ typedef HRESULT(WINAPI *pWerUnregisterRuntimeExceptionModule)(PCWSTR, PVOID);
 // virtualization. Direct writes to HKCU WER key will be virtualized only for
 // the package, so WerFault.exe cannot see them. This can lead to the WER module
 // not being loaded. Additionally, it is not possible for WerFault.exe or other
-// processes to LoadLibrary DLLs from within a MSIX package due to restricted
-// ACLs. Therefore:
+// processes without the package identity to LoadLibrary DLLs from within a MSIX
+// package due to restricted ACLs. Therefore:
 //   1) Create the required registry value by using reg.exe so the write occurs
 //      outside any registry virtualization layer (as processes started by the
 //      package and not contained in the package will not have package identity
@@ -380,9 +380,6 @@ wer_backend_startup(sentry_backend_t *backend, const sentry_options_t *options)
         }
     }
 
-    // Flags & auxiliary networking fields (v5+)
-    // Consent required? Mirror logic of sentry__should_skip_upload but
-    // evaluated ahead-of-crash. Module will still sanity check.
     if (options->require_user_consent) {
         state->runtime_ctx->flags |= SENTRY_WER_FLAG_REQUIRE_CONSENT;
     }
@@ -415,10 +412,11 @@ wer_backend_startup(sentry_backend_t *backend, const sentry_options_t *options)
     SENTRY_DEBUGF("WER module path=%S (custom=%d msix=%d)", module_pathp->path,
         custom_handler ? 1 : 0, is_msix ? 1 : 0);
 
-    // MSIX: place a *stable* copy of the runtime module in the user provided
-    // database (cache) directory if available instead of the per-run directory
-    // which contains a random component. This keeps the registry value from
-    // changing every process start and avoids accumulating stale values.
+    // MSIX handling
+    // Copy the WER module to a readable/loadable
+    // location outside of the install directory - the user-provided database
+    // (cache) directory is a suitable location.
+    // See comment in wer_is_msix_packaged().
     if (is_msix) {
         const sentry_path_t *cache_root = options->database_path
             ? options->database_path
