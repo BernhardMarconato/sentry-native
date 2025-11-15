@@ -692,7 +692,7 @@ elseif(SENTRY_BACKEND_WER)
 		"$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
 		"$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>"
 	)
-	target_link_libraries(sentry_wer_module PRIVATE dbghelp winhttp Shlwapi)
+	target_link_libraries(sentry_wer_module PRIVATE dbghelp winhttp Shlwapi Psapi)
 	if(SENTRY_BUILD_RUNTIMESTATIC AND MSVC)
 		set_property(TARGET sentry_wer_module PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 	endif()

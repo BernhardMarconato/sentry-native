@@ -11,11 +11,16 @@ extern "C" {
 #include "sentry_utils.h"
 #include "sentry_wer_common.h"
 }
+#include <array>
 #include <dbghelp.h>
+#include <limits.h>
 #include <shlwapi.h>
+#include <stdint.h>
 #include <strsafe.h>
 #include <werapi.h>
 #include <winhttp.h>
+
+#include "sentry_wer_stowed.h"
 
 // Minimal global state used only after callback copies run_path from context.
 struct sentry_wer_state {
@@ -92,6 +97,46 @@ log_line(const wchar_t *fmt, ...)
     OutputDebugStringW(buf);
 }
 
+struct sentry_minidump_callback_ctx {
+    const sentry_minidump_memory_range *ranges;
+    size_t range_count;
+    size_t next_index;
+};
+
+// Minidump callback to provide custom memory ranges from stowed data.
+static BOOL CALLBACK
+sentry_minidump_callback(PVOID ctx,
+    const PMINIDUMP_CALLBACK_INPUT callback_input,
+    PMINIDUMP_CALLBACK_OUTPUT callback_output)
+{
+    if (!ctx || !callback_input || !callback_output) {
+        return FALSE;
+    }
+    sentry_minidump_callback_ctx *cb_ctx = (sentry_minidump_callback_ctx *)ctx;
+    switch (callback_input->CallbackType) {
+    case MemoryCallback:
+        if (!cb_ctx->ranges || cb_ctx->next_index >= cb_ctx->range_count) {
+            return FALSE;
+        }
+        callback_output->MemoryBase = cb_ctx->ranges[cb_ctx->next_index].base;
+        callback_output->MemorySize = cb_ctx->ranges[cb_ctx->next_index].size;
+        cb_ctx->next_index++;
+        return TRUE;
+    case CancelCallback:
+        callback_output->CheckCancel = FALSE;
+        callback_output->Cancel = FALSE;
+        return TRUE;
+    case IncludeThreadCallback:
+    case ThreadCallback:
+    case ThreadExCallback:
+    case IncludeModuleCallback:
+    case ModuleCallback:
+        return TRUE;
+    default:
+        return TRUE;
+    }
+}
+
 // Create a timestamped dump filename (UTC) for uniqueness.
 static bool
 create_dump_name(wchar_t *out, size_t cap)
@@ -111,16 +156,16 @@ write_minidump(const PWER_RUNTIME_EXCEPTION_INFORMATION info, wchar_t *path_out,
     if (!info || !path_out) {
         return false;
     }
-    wchar_t file[64];
-    if (!create_dump_name(file, _countof(file))) {
+    std::array<wchar_t, 64> dump_name = {};
+    if (!create_dump_name(dump_name.data(), dump_name.size())) {
         return false;
     }
-    if (!build_run_path_file(path_out, cap, file)) {
+    if (!build_run_path_file(path_out, cap, dump_name.data())) {
         return false;
     }
-    HANDLE h = CreateFileW(path_out, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
+    sentry_unique_handle dump_file(CreateFileW(path_out, GENERIC_WRITE, 0,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!dump_file.valid()) {
         log_line(L"CreateFile failed err=%lu", GetLastError());
         return false;
     }
@@ -129,9 +174,33 @@ write_minidump(const PWER_RUNTIME_EXCEPTION_INFORMATION info, wchar_t *path_out,
     mei.ClientPointers = FALSE;
     EXCEPTION_POINTERS exc_ptrs = { &info->exceptionRecord, &info->context };
     mei.ExceptionPointers = &exc_ptrs;
-    BOOL ok = MiniDumpWriteDump(info->hProcess, GetProcessId(info->hProcess), h,
-        MiniDumpWithThreadInfo, &mei, nullptr, nullptr);
-    CloseHandle(h);
+    std::array<sentry_minidump_memory_range, SENTRY_WER_STOWED_MAX_RANGES>
+        ranges = {};
+    wchar_t stack_path[MAX_PATH];
+    const wchar_t *stack_path_ptr = nullptr;
+    if (g_state.run_path[0]
+        && build_run_path_file(
+            stack_path, _countof(stack_path), SENTRY_WER_STOWED_STACK_FILE_W)) {
+        DeleteFileW(stack_path);
+        stack_path_ptr = stack_path;
+    }
+    size_t range_count = sentry_stowed_collect_memory_ranges(
+        log_line, info, ranges.data(), ranges.size(), stack_path_ptr);
+    sentry_minidump_callback_ctx cb_ctx = {};
+    MINIDUMP_CALLBACK_INFORMATION cb_info = {};
+    PMINIDUMP_CALLBACK_INFORMATION cb_info_ptr = nullptr;
+    if (range_count) {
+        cb_ctx.ranges = ranges.data();
+        cb_ctx.range_count = range_count;
+        cb_ctx.next_index = 0;
+        cb_info.CallbackRoutine = sentry_minidump_callback;
+        cb_info.CallbackParam = &cb_ctx;
+        cb_info_ptr = &cb_info;
+        log_line(L"Adding %Iu stowed memory ranges to minidump", range_count);
+    }
+    BOOL ok = MiniDumpWriteDump(info->hProcess, GetProcessId(info->hProcess),
+        dump_file.get(), MiniDumpWithThreadInfo, &mei, nullptr, cb_info_ptr);
+    dump_file.reset();
     if (!ok) {
         log_line(L"MiniDumpWriteDump failed err=%lu", GetLastError());
         DeleteFileW(path_out);
@@ -147,29 +216,25 @@ read_file(const wchar_t *path, BYTE **data, DWORD *len)
 {
     *data = nullptr;
     *len = 0;
-    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
+    sentry_unique_handle file(CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file.valid()) {
         return false;
     }
     LARGE_INTEGER sz;
-    if (!GetFileSizeEx(h, &sz) || sz.HighPart) {
-        CloseHandle(h);
+    if (!GetFileSizeEx(file.get(), &sz) || sz.HighPart) {
         return false;
     }
     DWORD size = sz.LowPart;
     BYTE *buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, size);
     if (!buf) {
-        CloseHandle(h);
         return false;
     }
     DWORD rd = 0;
-    if (!ReadFile(h, buf, size, &rd, nullptr) || rd != size) {
+    if (!ReadFile(file.get(), buf, size, &rd, nullptr) || rd != size) {
         HeapFree(GetProcessHeap(), 0, buf);
-        CloseHandle(h);
         return false;
     }
-    CloseHandle(h);
     *data = buf;
     *len = size;
     return true;
@@ -309,6 +374,21 @@ upload_dump(
         log_line(L"Including breadcrumb2 (%lu bytes)", bc2_len);
     }
 
+    wchar_t stack_txt_path[MAX_PATH];
+    BYTE *stack_txt_data = nullptr;
+    DWORD stack_txt_len = 0;
+    bool have_stack_txt = false;
+    bool stack_txt_path_ok = build_run_path_file(stack_txt_path,
+        _countof(stack_txt_path), SENTRY_WER_STOWED_STACK_FILE_W);
+    if (stack_txt_path_ok && file_exists(stack_txt_path)
+        && read_file(stack_txt_path, &stack_txt_data, &stack_txt_len)
+        && stack_txt_len) {
+        have_stack_txt = true;
+        log_line(L"Including stowed stack text (%lu bytes)", stack_txt_len);
+    } else if (stack_txt_path_ok) {
+        log_line(L"No stowed stack text file present");
+    }
+
     // rel_path already resolved above
     char boundary[64];
     {
@@ -340,6 +420,11 @@ upload_dump(
     if (have_bc2 && !err) {
         err = append_part_fn(&sb, boundary, SENTRY_WER_MP_BREADCRUMB2_PART,
             SENTRY_WER_MP_BREADCRUMB2_PART, bc2_data, bc2_len, true);
+    }
+    if (have_stack_txt && !err) {
+        err = append_part_fn(&sb, boundary, SENTRY_WER_MP_STOWED_STACK_PART,
+            SENTRY_WER_STOWED_STACK_FILE_A, stack_txt_data, stack_txt_len,
+            true);
     }
     // Dump part: CRLF not appended here; a footer starting with CRLF is added
     // later.
@@ -394,6 +479,8 @@ upload_dump(
         HeapFree(GetProcessHeap(), 0, bc1_data);
     if (bc2_data)
         HeapFree(GetProcessHeap(), 0, bc2_data);
+    if (stack_txt_data)
+        HeapFree(GetProcessHeap(), 0, stack_txt_data);
     log_line(L"Upload %s", ok ? L"ok" : L"fail");
     return ok;
 }
@@ -438,18 +525,17 @@ write_crash_marker()
             marker_path, _countof(marker_path), SENTRY_WER_LAST_CRASH_FILE_W)) {
         return;
     }
-    HANDLE mh = CreateFileW(marker_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL, NULL);
-    if (mh == INVALID_HANDLE_VALUE) {
+    sentry_unique_handle marker(CreateFileW(marker_path, GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL));
+    if (!marker.valid()) {
         return;
     }
     char buf[32];
     int n = _snprintf_s(buf, _TRUNCATE, "%llu", (unsigned long long)usec);
     if (n > 0) {
         DWORD wr;
-        WriteFile(mh, buf, (DWORD)strlen(buf), &wr, NULL);
+        WriteFile(marker.get(), buf, (DWORD)strlen(buf), &wr, NULL);
     }
-    CloseHandle(mh);
     // marker file written
 }
 
